@@ -29,21 +29,40 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
         return dist.get_world_size(), dist.get_rank()
 
     rank, world_size = rank_and_world_size
-    os.environ["MASTER_ADDR"] = "localhost"
-
-    if (rank is None) or (world_size is None):
+    
+    # First priority: Use torchrun environment variables
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # torchrun already sets MASTER_ADDR and MASTER_PORT
+        logger.info(f"Using torchrun env vars: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+    elif (rank is None) or (world_size is None):
+        # Second priority: Use SLURM environment variables
         try:
             world_size = int(os.environ["SLURM_NTASKS"])
             rank = int(os.environ["SLURM_PROCID"])
             os.environ["MASTER_ADDR"] = os.environ["HOSTNAME"]
+            os.environ["MASTER_PORT"] = str(port)
+            logger.info(f"Using SLURM env vars: rank={rank}, world_size={world_size}")
         except Exception:
             logger.info("SLURM vars not set (distributed training not available)")
             world_size, rank = 1, 0
             return world_size, rank
+    else:
+        # Third priority: Use provided rank_and_world_size
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(port)
+        logger.info(f"Using provided values: rank={rank}, world_size={world_size}")
 
     try:
-        os.environ["MASTER_PORT"] = str(port)
-        torch.distributed.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+        # Initialize process group even for single process to support DDP in debug mode
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        torch.distributed.init_process_group(backend=backend, world_size=world_size, rank=rank)
+        if world_size > 1:
+            logger.info(f"Successfully initialized distributed training: rank {rank}/{world_size}")
+        else:
+            logger.info(f"Single process training with DDP support: rank {rank}/{world_size}")
     except Exception as e:
         world_size, rank = 1, 0
         logger.info(f"Rank: {rank}. Distributed training not available {e}")

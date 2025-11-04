@@ -1,0 +1,78 @@
+app: vjepa_droid_decoder
+tasks_per_node: 8
+cpus_per_task: 8
+nodes: 1
+tasks_per_node: 8  # 8 GPUs
+mem_per_gpu: 48G
+folder: /nvmessd/yinzi/vjepa2/checkpoints/decoder_train
+data:
+  batch_size: 4  # Reduced batch size due to longer door episodes
+  camera_views:
+  - left_mp4_path
+  crop_size: 256
+  datasets:
+    - /nvmessd/yinzi/vjepa2/datasets/go_stanford_converted/go_stanford_train_paths.csv
+  dataset_fpcs:
+  - 8
+  fps: 10
+  num_workers: 4  # Adjusted for 4 GPUs
+  patch_size: 16
+  pin_mem: true
+  stereo_view: false
+  tubelet_size: 2
+  camera_frame: false
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.95
+  - 1.05
+  random_resize_scale:
+  - 0.9
+  - 1.1
+  reprob: 0.0
+loss:
+  auto_steps: 3
+  loss_exp: 2.0
+  normalize_reps: true
+  reg_coeff: 0.0
+  # Door navigation task: only x, y, yaw (rz) dimensions are effective
+  # Action dims: [x, y, z, rx, ry, rz, gripper] -> [0, 1, 2, 3, 4, 5, 6]
+  effective_action_dims: [0, 1, 5]  # x, y, yaw only for navigation
+  action_loss_weight: 1.0
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  load_encoder: true
+  load_checkpoint: true
+  read_checkpoint: null
+  pretrain_checkpoint: /nvmessd/yinzi/vjepa2/checkpoints/vitl.pt
+  context_encoder_key: encoder
+  save_every_freq: 50
+  seed: 239
+  use_sdpa: true
+model:
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  anneal: 1
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 10
+  final_lr: 0.000525
+  final_weight_decay: 0.04
+  ipe: 300
+  ipe_scale: 1.25
+  lr: 0.000525
+  start_lr: 0.0001
+  warmup: 40
+  weight_decay: 0.04

@@ -1,0 +1,76 @@
+app: vjepa_droid
+cpus_per_task: 4
+folder: /nvmessd/yinzi/vjepa2/checkpoints/go_stanford_finetune_4gpu_25_08_18_21_06
+mem_per_gpu: 48G
+nodes: 1
+tasks_per_node: 4  # 8 GPUs
+data:
+  batch_size: 8  # Increased from 4 to 8 per GPU
+  camera_views:
+  - left_mp4_path
+  crop_size: 256
+  datasets:
+    - /nvmessd/yinzi/vjepa2/datasets/go_stanford_converted/go_stanford_train_paths.csv
+  dataset_fpcs:
+  - 8
+  fps: 10
+  num_workers: 8  # More workers for 8 GPUs
+  patch_size: 16
+  pin_mem: true
+  stereo_view: false
+  tubelet_size: 2
+  camera_frame: false
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.95
+  - 1.05
+  random_resize_scale:
+  - 0.9
+  - 1.1
+  reprob: 0.0
+loss:
+  auto_steps: 3
+  loss_exp: 2.0
+  normalize_reps: true
+  reg_coeff: 0.0
+  # Navigation task: only x, y, yaw (rz) dimensions are effective
+  # Action dims: [x, y, z, rx, ry, rz, gripper] -> [0, 1, 2, 3, 4, 5, 6]
+  effective_action_dims: [0, 1, 5]  # x, y, yaw only for navigation
+  action_loss_weight: 1.0  # Weight for action-related loss terms
+meta:
+  dtype: bfloat16
+  eval_freq: 20
+  resume_checkpoint: null
+  load_predictor: true
+  load_encoder: true
+  pretrain_checkpoint: /nvmessd/yinzi/vjepa2/checkpoints/pretrained/vjepa2_ac_vitg.pt
+  context_encoder_key: encoder
+  target_encoder_key: target_encoder
+  save_every_freq: 10  # Save more frequently with faster training
+  seed: 239
+  use_sdpa: true
+model:
+  model_name: vit_giant_xformers
+  pred_depth: 24
+  pred_embed_dim: 1024
+  pred_is_frame_causal: true
+  pred_num_heads: 16
+  uniform_power: true
+  use_activation_checkpointing: false
+  use_extrinsics: false
+  use_rope: true
+optimization:
+  # Adjusted for 8 GPU training
+  anneal: 5
+  epochs: 30  # Reduced epochs since we have 8x effective batch size
+  final_lr: 0.0
+  final_weight_decay: 0.04
+  ipe: 300  # Reduced iterations per epoch
+  lr: 0.00008  # Increased LR for larger batch size (linear scaling)
+  enc_lr_scale: 0.0  # Keep encoder frozen
+  start_lr: 0.000008
+  warmup: 3  # Shorter warmup
+  weight_decay: 0.04

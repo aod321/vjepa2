@@ -1,50 +1,51 @@
 app: vjepa_droid
 cpus_per_task: 4
-folder: /nvmessd/yinzi/vjepa2/checkpoints/droid_test/4.8.vitg16-256px-8f
+folder: /nvmessd/yinzi/vjepa2/checkpoints/go_stanford_finetune
 mem_per_gpu: 48G
 nodes: 1
 tasks_per_node: 1
 data:
-  batch_size: 2
+  batch_size: 4
   camera_views:
   - left_mp4_path
   crop_size: 256
   datasets:
-    - /nvmessd/yinzi/vjepa2/datasets/droid_converted/droid_train_paths.csv
+    - /nvmessd/yinzi/vjepa2/datasets/go_stanford_converted/go_stanford_train_paths.csv
   dataset_fpcs:
   - 8
-  fps: 15
-  num_workers: 2
+  fps: 10  # Adjusted for navigation data
+  num_workers: 4
   patch_size: 16
   pin_mem: true
   stereo_view: false
   tubelet_size: 2
+  camera_frame: false  # Data is in world frame
 data_aug:
   auto_augment: false
-  horizontal_flip: false
+  horizontal_flip: false  # Important: no flipping for navigation
   motion_shift: false
   random_resize_aspect_ratio:
-  - 0.75
-  - 1.35
+  - 0.95
+  - 1.05  # Minimal distortion
   random_resize_scale:
-  - 1.777
-  - 1.777
+  - 0.9
+  - 1.1
   reprob: 0.0
 loss:
-  auto_steps: 2
-  loss_exp: 1.0
+  auto_steps: 3  # Longer horizon for navigation
+  loss_exp: 2.0  # L2 loss
   normalize_reps: true
   reg_coeff: 0.0
 meta:
   dtype: bfloat16
-  eval_freq: 100
+  eval_freq: 20
   resume_checkpoint: null
   load_predictor: true
   load_encoder: true
   pretrain_checkpoint: /nvmessd/yinzi/vjepa2/checkpoints/pretrained/vjepa2_ac_vitg.pt
   context_encoder_key: encoder
   target_encoder_key: target_encoder
-  save_every_freq: 25
+  save_every_freq: 20
   seed: 239
   use_sdpa: true
 model:
@@ -54,16 +55,19 @@ model:
   pred_is_frame_causal: true
   pred_num_heads: 16
   uniform_power: true
-  use_activation_checkpointing: true
-  use_extrinsics: false
+  use_activation_checkpointing: false
+  use_extrinsics: false  # No camera extrinsics for navigation
   use_rope: true
 optimization:
-  anneal: 1
-  epochs: 2
+  # Navigation fine-tuning parameters
+  anneal: 5
+  epochs: 50
   final_lr: 0.0
   final_weight_decay: 0.04
-  ipe: 2
-  lr: 0.000425
-  start_lr: 0.000075
-  warmup: 1
+  ipe: 300  # iterations per epoch
+  lr: 0.00002  # Conservative learning rate
+  # enc_lr_scale: 0.2  # Encoder learns slower
+  enc_lr_scale: 0.0  # Encoder fronzon (no laerning)
+  start_lr: 0.000002
+  warmup: 5
   weight_decay: 0.04

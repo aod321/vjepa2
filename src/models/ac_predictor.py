@@ -43,11 +43,21 @@ class VisionTransformerPredictorAC(nn.Module):
         use_rope=True,
         action_embed_dim=7,
         use_extrinsics=False,
+        effective_action_dims=None,
         **kwargs
     ):
         super().__init__()
         self.is_frame_causal = is_frame_causal
         self.use_extrinsics = use_extrinsics
+        self.effective_action_dims = effective_action_dims
+        
+        # Create action dimension mask for navigation task optimization
+        if effective_action_dims is not None:
+            action_mask = torch.zeros(action_embed_dim)
+            action_mask[effective_action_dims] = 1.0
+            self.register_buffer('action_mask', action_mask)
+        else:
+            self.register_buffer('action_mask', torch.ones(action_embed_dim))
 
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
@@ -142,6 +152,15 @@ class VisionTransformerPredictorAC(nn.Module):
         B, N_ctxt, D = x.size()
         T = N_ctxt // (self.grid_height * self.grid_width)
 
+        # Apply action dimension masking for navigation task optimization
+        if self.effective_action_dims is not None:
+            actions = actions * self.action_mask.unsqueeze(0).unsqueeze(0)
+            states = states * self.action_mask.unsqueeze(0).unsqueeze(0)
+            if extrinsics is not None:
+                # For extrinsics, mask all but the last dimension (gripper is excluded)
+                extr_mask = self.action_mask[:-1] if len(self.action_mask) > 1 else self.action_mask
+                extrinsics = extrinsics * extr_mask.unsqueeze(0).unsqueeze(0)
+        
         # Interleave action tokens
         s = self.state_encoder(states).unsqueeze(2)
         a = self.action_encoder(actions).unsqueeze(2)
