@@ -130,6 +130,8 @@ def main(args, resume_preempt=False):
     loss_exp = cfgs_loss.get("loss_exp")
     normalize_reps = cfgs_loss.get("normalize_reps")
     auto_steps = min(cfgs_loss.get("auto_steps", 1), max_num_frames)
+    effective_action_dims = cfgs_loss.get("effective_action_dims", None)  # For navigation task optimization
+    action_loss_weight = cfgs_loss.get("action_loss_weight", 1.0)
     # --
     tokens_per_frame = int((crop_size // patch_size) ** 2)
 
@@ -166,7 +168,9 @@ def main(args, resume_preempt=False):
     if not torch.cuda.is_available():
         device = torch.device("cpu")
     else:
-        device = torch.device("cuda:0")
+        # Use the appropriate GPU for this rank
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
 
     # -- log/checkpointing paths
@@ -209,6 +213,7 @@ def main(args, resume_preempt=False):
         wide_silu=wide_silu,
         use_rope=use_rope,
         use_activation_checkpointing=use_activation_checkpointing,
+        effective_action_dims=effective_action_dims,
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -391,6 +396,19 @@ def main(args, resume_preempt=False):
                 actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
                 states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
                 extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
+                
+                # Apply action dimension filtering for navigation tasks
+                if effective_action_dims is not None:
+                    # Create mask for ineffective dimensions  
+                    action_mask = torch.ones(7, device=device)
+                    action_mask[effective_action_dims] = action_loss_weight
+                    # Zero out ineffective action dimensions to reduce their influence
+                    ineffective_dims = [i for i in range(7) if i not in effective_action_dims]
+                    if len(ineffective_dims) > 0:
+                        actions[:, :, ineffective_dims] *= 0.1  # Reduce but don't completely zero
+                        states[:, :, ineffective_dims] *= 0.1
+                        # Skip extrinsics since it's 6D and all zeros anyway
+                
                 return (clips, actions, states, extrinsics)
 
             clips, actions, states, extrinsics = load_clips()
@@ -438,7 +456,7 @@ def main(args, resume_preempt=False):
 
                 def loss_fn(z, h):
                     _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
-                    return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
+                    return F.mse_loss(z, _h)
 
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):

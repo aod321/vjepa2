@@ -63,6 +63,7 @@ parser.add_argument(
     help="If specified, cluster partition to use when submitting jobs",
 )
 parser.add_argument("--time", type=int, default=4300, help="time in minutes to run job")
+parser.add_argument("--skip-code-copy", action="store_true", help="Skip copying code (for single-machine setups)")
 
 
 class Trainer:
@@ -134,6 +135,7 @@ def launch_app_with_parsed_args(
     tasks_per_node=1,
     cpus_per_task=12,
     exclude_nodes=None,
+    skip_code_copy=False,
 ):
     args_for_pretrain = update_folder_with_timestamp(args_for_pretrain)
     for ap in args_for_pretrain:
@@ -142,20 +144,26 @@ def launch_app_with_parsed_args(
     folder = args_for_pretrain[0]["folder"]
 
     # -------------- Copy code --------------
-    code_folder = os.path.join(folder, "code")
-    ignore_patterns = [
-        "__pycache__",
-        ".vscode",
-        ".git",
-        "core",
-    ]
-    ignore_paths = [
-        "./evals/ava/alphaction/data",
-        "./demos",
-        "./traces",
-    ]
-    copy_code_folder(code_folder, ignore_patterns, ignore_paths)
-    os.chdir(code_folder)
+    if skip_code_copy:
+        # Use current directory directly for single-machine setups
+        code_folder = os.getcwd()
+        logger.info(f"Skipping code copy, using current directory: {code_folder}")
+    else:
+        # Copy code for multi-machine setups
+        code_folder = os.path.join(folder, "code")
+        ignore_patterns = [
+            "__pycache__",
+            ".vscode",
+            ".git",
+            "core",
+        ]
+        ignore_paths = [
+            "./evals/ava/alphaction/data",
+            "./demos",
+            "./traces",
+        ]
+        copy_code_folder(code_folder, ignore_patterns, ignore_paths)
+        os.chdir(code_folder)
     # ---------------------------------------
 
     # -------------- Save config file --------------
@@ -260,6 +268,7 @@ def launch():
         nodes=nodes,
         tasks_per_node=tasks_per_node,
         exclude_nodes=args.exclude,
+        skip_code_copy=args.skip_code_copy,
     )
     # ---------------------------------------------------------------------- #
 

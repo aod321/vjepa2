@@ -6,7 +6,7 @@
 import numpy as np
 import torch.nn.functional as F
 
-from .mpc_utils import cem, compute_new_pose
+from .mpc_utils import cem, compute_new_pose, compute_new_pose_gpu
 
 
 class WorldModel(object):
@@ -29,6 +29,7 @@ class WorldModel(object):
         },
         normalize_reps=True,
         device="cuda:0",
+        force_gpu=True,
     ):
         super().__init__()
         self.encoder = encoder
@@ -38,6 +39,7 @@ class WorldModel(object):
         self.tokens_per_frame = tokens_per_frame
         self.device = device
         self.mpc_args = mpc_args
+        self.force_gpu = force_gpu
 
     def encode(self, image):
         clip = np.expand_dims(image, axis=0)
@@ -51,7 +53,7 @@ class WorldModel(object):
             h = F.layer_norm(h, (h.size(-1),))
         return h
 
-    def infer_next_action(self, rep, pose, goal_rep, close_gripper=None):
+    def infer_next_action(self, rep, pose, goal_rep, close_gripper=None, show_progress=True):
 
         def step_predictor(reps, actions, poses):
             B, T, N_T, D = reps.size()
@@ -60,7 +62,12 @@ class WorldModel(object):
             if self.normalize_reps:
                 next_rep = F.layer_norm(next_rep, (next_rep.size(-1),))
             next_rep = next_rep.view(B, 1, N_T, D)
-            next_pose = compute_new_pose(poses[:, -1:], actions[:, -1:])
+            
+            # 使用GPU版本的compute_new_pose如果启用force_gpu
+            if self.force_gpu and poses.device.type == 'cuda':
+                next_pose = compute_new_pose_gpu(poses[:, -1:], actions[:, -1:])
+            else:
+                next_pose = compute_new_pose(poses[:, -1:], actions[:, -1:])
             return next_rep, next_pose
 
         mpc_action = cem(
@@ -69,6 +76,7 @@ class WorldModel(object):
             goal_frame=goal_rep,
             world_model=step_predictor,
             close_gripper=close_gripper,
+            show_progress=show_progress,
             **self.mpc_args,
         )[0]
 

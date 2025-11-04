@@ -10,8 +10,8 @@ import sys
 
 import torch
 
-import src.models.ac_predictor as vit_ac_pred
 import src.models.vision_transformer as video_vit
+from src.models.vjepa2_decoder import VJEPA2FrameDecoder
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.schedulers import CosineWDSchedule, WSDSchedule
 
@@ -22,55 +22,23 @@ logger = logging.getLogger()
 def load_pretrained(
     r_path,
     encoder=None,
-    predictor=None,
-    target_encoder=None,
     context_encoder_key="encoder",
-    target_encoder_key="target_encoder",
-    load_predictor=False,
     load_encoder=True,
 ):
-    if not r_path:
-        logger.info("No pretrained checkpoint provided; skipping load.")
-        return (
-            encoder,
-            predictor,
-            target_encoder,
-        )
     logger.info(f"Loading pretrained model from {r_path}")
     checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
-
-    epoch = checkpoint["epoch"]
 
     if load_encoder:
         # -- loading encoder
         pretrained_dict = checkpoint[context_encoder_key]
         pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        if "module." not in encoder.state_dict().keys() and "module." in next(iter(pretrained_dict)):
+            pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
         msg = encoder.load_state_dict(pretrained_dict, strict=False)
-        logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
-
-    if load_predictor:
-        # -- loading predictor
-        pretrained_dict = checkpoint["predictor"]
-        pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
-        msg = predictor.load_state_dict(pretrained_dict, strict=False)
-        logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
-
-    # -- loading target_encoder
-    if load_encoder:
-        if target_encoder is not None:
-            print(list(checkpoint.keys()))
-            pretrained_dict = checkpoint[target_encoder_key]
-            pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
-            msg = target_encoder.load_state_dict(pretrained_dict, strict=False)
-            logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
+        logger.info(f"loaded pretrained encoder with msg: {msg}")
 
     del checkpoint
-
-    return (
-        encoder,
-        predictor,
-        target_encoder,
-    )
+    return encoder
 
 
 def load_checkpoint(
@@ -154,6 +122,12 @@ def init_video_model(
     use_extrinsics=False,
     old_pred=False,
     effective_action_dims=None,
+    decoder_embed_dim=None,
+    decoder_depth=None,
+    decoder_num_heads=None,
+    decoder_mlp_ratio=4.0,
+    decoder_dropout=0.0,
+    decoder_attn_dropout=0.0,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -167,45 +141,40 @@ def init_video_model(
         use_activation_checkpointing=use_activation_checkpointing,
         use_rope=use_rope,
     )
+    decoder_embed_dim = decoder_embed_dim or encoder.embed_dim
+    decoder_depth = decoder_depth or encoder.get_num_layers()
+    decoder_num_heads = decoder_num_heads or encoder.num_heads
 
-    predictor = vit_ac_pred.__dict__["vit_ac_predictor"](
-        img_size=crop_size,
+    decoder = VJEPA2FrameDecoder(
+        encoder_dim=encoder.embed_dim,
+        image_size=crop_size,
         patch_size=patch_size,
-        num_frames=max_num_frames,
         tubelet_size=tubelet_size,
-        embed_dim=encoder.embed_dim,
-        predictor_embed_dim=pred_embed_dim,
-        action_embed_dim=action_embed_dim,
-        depth=pred_depth,
-        is_frame_causal=pred_is_frame_causal,
-        num_heads=encoder.num_heads if pred_num_heads is None else pred_num_heads,
-        uniform_power=uniform_power,
-        use_rope=use_rope,
-        use_sdpa=use_sdpa,
-        use_silu=use_pred_silu,
-        wide_silu=wide_silu,
-        use_extrinsics=use_extrinsics,
-        use_activation_checkpointing=use_activation_checkpointing,
-        effective_action_dims=effective_action_dims,
+        channels=3,
+        decoder_embed_dim=decoder_embed_dim,
+        depth=decoder_depth,
+        num_heads=decoder_num_heads,
+        mlp_ratio=decoder_mlp_ratio,
+        dropout=decoder_dropout,
+        attention_dropout=decoder_attn_dropout,
     )
-
     encoder.to(device)
-    predictor.to(device)
+    decoder.to(device)
     logger.info(encoder)
-    logger.info(predictor)
+    logger.info(decoder)
 
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     logger.info(f"Encoder number of parameters: {count_parameters(encoder)}")
-    logger.info(f"Predictor number of parameters: {count_parameters(predictor)}")
+    logger.info(f"Decoder number of parameters: {count_parameters(decoder)}")
 
-    return encoder, predictor
+    return encoder, decoder
 
 
 def init_opt(
     encoder,
-    predictor,
+    decoder,
     iterations_per_epoch,
     start_lr,
     ref_lr,
@@ -221,36 +190,50 @@ def init_opt(
     zero_init_bias_wd=True,
     enc_lr_scale=1.0,
 ):
-    param_groups = [
-        {
-            "params": (p for n, p in encoder.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
-            "lr_scale": enc_lr_scale,
-        },
-        {
-            "params": (p for n, p in predictor.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
-        },
-        {
-            "params": (p for n, p in encoder.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
-            "WD_exclude": zero_init_bias_wd,
-            "weight_decay": 0,
-            "lr_scale": enc_lr_scale,
-        },
-        {
-            "params": (p for n, p in predictor.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
-            "WD_exclude": zero_init_bias_wd,
-            "weight_decay": 0,
-        },
-    ]
+    def filtered_params(module, predicate):
+        if module is None:
+            return []
+        return [p for name, p in module.named_parameters() if predicate(name, p) and p.requires_grad]
+
+    param_groups = []
+
+    enc_main = filtered_params(encoder, lambda n, p: ("bias" not in n) and (len(p.shape) != 1))
+    if enc_main:
+        param_groups.append({"params": enc_main, "lr_scale": enc_lr_scale})
+
+    dec_main = filtered_params(decoder, lambda n, p: ("bias" not in n) and (len(p.shape) != 1))
+    if dec_main:
+        param_groups.append({"params": dec_main})
+
+    enc_bias = filtered_params(encoder, lambda n, p: ("bias" in n) or (len(p.shape) == 1))
+    if enc_bias:
+        param_groups.append(
+            {
+                "params": enc_bias,
+                "WD_exclude": zero_init_bias_wd,
+                "weight_decay": 0,
+                "lr_scale": enc_lr_scale,
+            }
+        )
+
+    dec_bias = filtered_params(decoder, lambda n, p: ("bias" in n) or (len(p.shape) == 1))
+    if dec_bias:
+        param_groups.append(
+            {
+                "params": dec_bias,
+                "WD_exclude": zero_init_bias_wd,
+                "weight_decay": 0,
+            }
+        )
+
+    if not param_groups:
+        raise ValueError("No trainable parameters found for optimizer.")
 
     optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
-    warmup = 0 if warmup is None else warmup
-    anneal = 0 if anneal is None else anneal
-    warmup_steps = int(float(warmup) * iterations_per_epoch)
-    anneal_steps = int(float(anneal) * iterations_per_epoch)
     scheduler = WSDSchedule(
         optimizer,
-        warmup_steps=warmup_steps,
-        anneal_steps=anneal_steps,
+        warmup_steps=int(warmup * iterations_per_epoch),
+        anneal_steps=int(anneal * iterations_per_epoch),
         start_lr=start_lr,
         ref_lr=ref_lr,
         final_lr=final_lr,

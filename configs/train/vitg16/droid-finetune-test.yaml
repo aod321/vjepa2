@@ -1,6 +1,6 @@
 app: vjepa_droid
 cpus_per_task: 4
-folder: /nvmessd/yinzi/vjepa2/checkpoints/droid_test/4.8.vitg16-256px-8f
+folder: /nvmessd/yinzi/vjepa2/checkpoints/droid_finetune_test
 mem_per_gpu: 48G
 nodes: 1
 tasks_per_node: 1
@@ -19,32 +19,33 @@ data:
   pin_mem: true
   stereo_view: false
   tubelet_size: 2
+  camera_frame: false
 data_aug:
   auto_augment: false
   horizontal_flip: false
   motion_shift: false
   random_resize_aspect_ratio:
-  - 0.75
-  - 1.35
+  - 0.9
+  - 1.1
   random_resize_scale:
-  - 1.777
-  - 1.777
+  - 0.9
+  - 1.1
   reprob: 0.0
 loss:
   auto_steps: 2
-  loss_exp: 1.0
+  loss_exp: 2.0
   normalize_reps: true
   reg_coeff: 0.0
 meta:
   dtype: bfloat16
-  eval_freq: 100
+  eval_freq: 10
   resume_checkpoint: null
   load_predictor: true
   load_encoder: true
   pretrain_checkpoint: /nvmessd/yinzi/vjepa2/checkpoints/pretrained/vjepa2_ac_vitg.pt
   context_encoder_key: encoder
   target_encoder_key: target_encoder
-  save_every_freq: 25
+  save_every_freq: 10
   seed: 239
   use_sdpa: true
 model:
@@ -54,16 +55,18 @@ model:
   pred_is_frame_causal: true
   pred_num_heads: 16
   uniform_power: true
-  use_activation_checkpointing: true
+  use_activation_checkpointing: false  # Disable for faster testing
   use_extrinsics: false
   use_rope: true
 optimization:
+  # Fine-tuning with smaller learning rate
   anneal: 1
-  epochs: 2
+  epochs: 5
   final_lr: 0.0
   final_weight_decay: 0.04
-  ipe: 2
-  lr: 0.000425
-  start_lr: 0.000075
+  ipe: 2  # iterations per epoch
+  lr: 0.00001  # Much smaller for fine-tuning
+  enc_lr_scale: 0.1  # Encoder learns 10x slower
+  start_lr: 0.000001
   warmup: 1
   weight_decay: 0.04

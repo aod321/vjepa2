@@ -43,6 +43,7 @@ def cem(
     axis={},
     objective=l1,
     close_gripper=None,
+    show_progress=True,
 ):
     """
     :param context_frame: [B=1, T=1, HW, D]
@@ -124,7 +125,7 @@ def cem(
         selected_actions = actions[indices]
         return selected_actions
 
-    for step in tqdm(range(cem_steps), disable=True):
+    for step in tqdm(range(cem_steps), disable=not show_progress, desc="CEM Optimization"):
         action_traj, frame_traj = sample_action_traj()
         selected_actions = select_topk_action_traj(
             final_state=frame_traj[:, -1], goal_state=goal_frame, actions=action_traj
@@ -163,12 +164,44 @@ def cem(
     return new_action
 
 
-def compute_new_pose(pose, action):
+def compute_new_pose_gpu(pose, action):
     """
+    GPU版本的pose计算，避免CPU转换
     :param pose: [B, T=1, 7]
     :param action: [B, T=1, 7]
     :returns: [B, T=1, 7]
     """
+    device, dtype = pose.device, pose.dtype
+    pose_curr = pose[:, 0]  # [B, 7]
+    action_curr = action[:, 0]  # [B, 7]
+    
+    # -- compute delta xyz (简单相加)
+    new_xyz = pose_curr[:, :3] + action_curr[:, :3]
+    
+    # -- 对于旋转，如果action中的旋转部分通常为0，可以简化处理
+    # 这里使用简化版本，直接相加（适用于小角度近似）
+    new_rotation = pose_curr[:, 3:6] + action_curr[:, 3:6]
+    
+    # -- compute delta gripper
+    new_closedness = torch.clamp(pose_curr[:, -1:] + action_curr[:, -1:], 0, 1)
+    
+    # -- new pose
+    new_pose = torch.cat([new_xyz, new_rotation, new_closedness], dim=-1)
+    return new_pose[:, None]  # [B, 1, 7]
+
+
+def compute_new_pose(pose, action):
+    """
+    原始CPU版本（保持兼容性）
+    :param pose: [B, T=1, 7]
+    :param action: [B, T=1, 7]
+    :returns: [B, T=1, 7]
+    """
+    # 如果在GPU上且旋转变化很小，使用GPU版本
+    if pose.device.type == 'cuda' and torch.allclose(action[:, :, 3:6], torch.zeros_like(action[:, :, 3:6]), atol=1e-3):
+        return compute_new_pose_gpu(pose, action)
+    
+    # 否则使用原始CPU版本
     device, dtype = pose.device, pose.dtype
     pose = pose[:, 0].cpu().numpy()
     action = action[:, 0].cpu().numpy()
