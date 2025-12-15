@@ -116,3 +116,5 @@ run_pretrain.py
 traces/
 third_party/*
 configs/local
+
+*.zip
