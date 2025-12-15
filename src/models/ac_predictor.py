@@ -116,16 +116,6 @@ class VisionTransformerPredictorAC(nn.Module):
         self.apply(self._init_weights)
         self._rescale_blocks()
 
-        attn_mask = None
-        if self.is_frame_causal:
-            grid_depth = self.num_frames // self.tubelet_size
-            grid_height = self.img_height // self.patch_size
-            grid_width = self.img_width // self.patch_size
-            attn_mask = build_action_block_causal_attention_mask(
-                grid_depth, grid_height, grid_width, add_tokens=3 if use_extrinsics else 2
-            )
-        self.attn_mask = attn_mask
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=self.init_std)
@@ -159,6 +149,12 @@ class VisionTransformerPredictorAC(nn.Module):
             if extrinsics is not None:
                 # For extrinsics, mask all but the last dimension (gripper is excluded)
                 extr_mask = self.action_mask[:-1] if len(self.action_mask) > 1 else self.action_mask
+                if extr_mask.numel() != extrinsics.shape[-1]:
+                    if extr_mask.numel() > extrinsics.shape[-1]:
+                        extr_mask = extr_mask[: extrinsics.shape[-1]]
+                    else:
+                        pad = (0, extrinsics.shape[-1] - extr_mask.numel())
+                        extr_mask = torch.nn.functional.pad(extr_mask, pad, value=1.0)
                 extrinsics = extrinsics * extr_mask.unsqueeze(0).unsqueeze(0)
         
         # Interleave action tokens
@@ -172,7 +168,11 @@ class VisionTransformerPredictorAC(nn.Module):
             x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
 
         cond_tokens = 3 if self.use_extrinsics else 2
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        attn_mask = None
+        if self.is_frame_causal:
+            attn_mask = build_action_block_causal_attention_mask(
+                T, self.grid_height, self.grid_width, add_tokens=cond_tokens
+            ).to(x.device, non_blocking=True)
 
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):

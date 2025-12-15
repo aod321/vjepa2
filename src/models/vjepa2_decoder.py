@@ -4,6 +4,37 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+class FrameRefinementHead(nn.Module):
+    def __init__(self, in_channels: int, hidden_channels: int) -> None:
+        super().__init__()
+        self.act = nn.GELU()
+        self.enc1 = nn.Conv3d(in_channels, hidden_channels, kernel_size=3, padding=1)
+        self.enc2 = nn.Conv3d(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=3,
+            stride=(1, 2, 2),
+            padding=1,
+        )
+        self.dec1 = nn.ConvTranspose3d(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=(1, 2, 2),
+            stride=(1, 2, 2),
+        )
+        self.dec2 = nn.Conv3d(hidden_channels, in_channels, kernel_size=3, padding=1)
+
+        nn.init.zeros_(self.dec2.weight)
+        nn.init.zeros_(self.dec2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.act(self.enc1(x))
+        down = self.act(self.enc2(y))
+        up = self.act(self.dec1(down))
+        up = up + y
+        residual = self.dec2(self.act(up))
+        return x + residual
+
 
 class VJEPA2FrameDecoder(nn.Module):
     """
@@ -43,6 +74,7 @@ class VJEPA2FrameDecoder(nn.Module):
             raise ValueError("image_size must be divisible by patch_size.")
 
         self.channels = channels
+        self.image_size = image_size
         self.patch_size = patch_size
         self.tubelet_size = tubelet_size
         self.grid_size = image_size // patch_size
@@ -73,6 +105,8 @@ class VJEPA2FrameDecoder(nn.Module):
         self.patch_head = nn.Linear(
             decoder_embed_dim, patch_size * patch_size * tubelet_size * channels
         )
+        refine_hidden = min(decoder_embed_dim // 4, 256)
+        self.refine_head = FrameRefinementHead(channels, refine_hidden)
 
     def forward(self, tokens, *, token_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -134,4 +168,5 @@ class VJEPA2FrameDecoder(nn.Module):
             pw=self.patch_size,
             c=self.channels,
         )
+        video = self.refine_head(video)
         return video

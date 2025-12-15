@@ -43,6 +43,7 @@ meta:
   resume_checkpoint: null
   load_predictor: true
   load_encoder: true
+  freeze_encoder: true
   pretrain_checkpoint: /nvmessd/yinzi/vjepa2/checkpoints/pretrained/vjepa2_ac_vitg.pt
   context_encoder_key: encoder
   target_encoder_key: target_encoder

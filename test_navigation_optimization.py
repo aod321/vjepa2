@@ -104,7 +104,7 @@ def test_config_loading():
         print("✓ Configuration loaded correctly for navigation task (x, y, yaw)")
     else:
         print("✗ Configuration not loaded correctly")
-
+    
 if __name__ == "__main__":
     test_config_loading()
     test_action_dimension_filtering()

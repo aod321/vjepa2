@@ -1,0 +1,82 @@
+app: vjepa_value_head
+tasks_per_node: 8
+cpus_per_task: 8
+nodes: 1
+mem_per_gpu: 48G
+folder: /nvmessd/yinzi/vjepa2/checkpoints/value_policy_head_vitg
+
+data:
+  batch_size: 8
+  crop_size: 256
+  datasets:
+    - /nvmessd/yinzi/vjepa2/datasets/ppo_dreamer_5000episodes_data_14-12-25-17_06/episode_index.csv
+  dataset_fpcs:
+    - 4
+  fps: 10
+  frame_stride: 1
+  num_workers: 8
+  patch_size: 16
+  pin_mem: true
+  tubelet_size: 2
+  sample_tail_prob: 0.2
+  derive_dones: true
+
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+    - 0.95
+    - 1.05
+  random_resize_scale:
+    - 0.9
+    - 1.1
+  reprob: 0.0
+
+loss:
+  gamma: 0.99
+  value_weight: 1.0
+  policy_weight: 1.0
+
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  resume_checkpoint: null
+  load_encoder: true
+  freeze_encoder: true
+  pretrain_checkpoint: /nvmessd/yinzi/vjepa2/checkpoints/pretrained/vjepa2_ac_vitg.pt
+  context_encoder_key: encoder
+  save_every_freq: 50
+  seed: 239
+  use_sdpa: true
+
+model:
+  model_name: vit_giant_xformers
+  uniform_power: true
+  use_activation_checkpointing: false
+  use_rope: true
+  use_silu: false
+  wide_silu: false
+  patch_size: 16
+  tubelet_size: 2
+  pooling: mean
+  head_hidden_dim: 512
+  head_layers: 1
+  head_dropout: 0.1
+  num_actions: 9
+
+optimization:
+  anneal: 1
+  ema:
+    - 0.99925
+    - 0.99925
+  epochs: 50
+  final_lr: 0.0002
+  final_weight_decay: 0.04
+  ipe: 300
+  lr: 0.0005
+  start_lr: 0.0001
+  warmup: 5
+  weight_decay: 0.04
+  enc_lr_scale: 0.0  # keep encoder frozen
+

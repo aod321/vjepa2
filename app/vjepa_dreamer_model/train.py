@@ -1,0 +1,532 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
+
+import os
+
+from sympy.functions.special.error_functions import real_to_real_as_real_imag
+
+# -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
+try:
+    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
+    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
+    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
+    # --          TO EACH PROCESS
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+except Exception:
+    pass
+
+import copy
+import gc
+import random
+import time
+
+import numpy as np
+import torch
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+from einops import rearrange, repeat
+from torch.nn.parallel import DistributedDataParallel
+from diffusers import DDPMScheduler
+
+from app.vjepa_dreamer_model.droid import init_data
+from app.vjepa_dreamer_model.transforms import make_transforms
+from app.vjepa_dreamer_model.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
+from src.utils.distributed import init_distributed
+from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+
+# --
+log_timings = True
+log_freq = 10
+CHECKPOINT_FREQ = 1
+GARBAGE_COLLECT_ITR_FREQ = 50
+# --
+
+_GLOBAL_SEED = 0
+random.seed(_GLOBAL_SEED)
+np.random.seed(_GLOBAL_SEED)
+torch.manual_seed(_GLOBAL_SEED)
+torch.backends.cudnn.benchmark = True
+
+
+logger = get_logger(__name__, force=True)
+
+
+def main(args, resume_preempt=False):
+    # ----------------------------------------------------------------------- #
+    #  PASSED IN PARAMS FROM CONFIG FILE
+    # ----------------------------------------------------------------------- #
+
+    # -- META
+    folder = args.get("folder")
+    cfgs_meta = args.get("meta")
+    r_file = cfgs_meta.get("resume_checkpoint", None)
+    p_file = cfgs_meta.get("pretrain_checkpoint", None)
+    # load_predictor = cfgs_meta.get("load_predictor", False)
+    context_encoder_key = cfgs_meta.get("context_encoder_key", "encoder")
+    target_encoder_key = cfgs_meta.get("target_encoder_key", "target_encoder")
+    load_encoder = cfgs_meta.get("load_encoder", True)
+    seed = cfgs_meta.get("seed", _GLOBAL_SEED)
+    save_every_freq = cfgs_meta.get("save_every_freq", -1)
+    skip_batches = cfgs_meta.get("skip_batches", -1)
+    use_sdpa = cfgs_meta.get("use_sdpa", False)
+    sync_gc = cfgs_meta.get("sync_gc", False)
+    which_dtype = cfgs_meta.get("dtype")
+    logger.info(f"{which_dtype=}")
+    if which_dtype.lower() == "bfloat16":
+        dtype = torch.bfloat16
+        mixed_precision = True
+    elif which_dtype.lower() == "float16":
+        dtype = torch.float16
+        mixed_precision = True
+    else:
+        dtype = torch.float32
+        mixed_precision = False
+
+    # -- MODEL
+    cfgs_model = args.get("model")
+    compile_model = cfgs_model.get("compile_model", False)
+    use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", False)
+    model_name = cfgs_model.get("model_name")
+    pred_depth = cfgs_model.get("pred_depth")
+    pred_num_heads = cfgs_model.get("pred_num_heads", None)
+    pred_embed_dim = cfgs_model.get("pred_embed_dim")
+    pred_is_frame_causal = cfgs_model.get("pred_is_frame_causal", True)
+    uniform_power = cfgs_model.get("uniform_power", False)
+    use_rope = cfgs_model.get("use_rope", False)
+    use_silu = cfgs_model.get("use_silu", False)
+    use_pred_silu = cfgs_model.get("use_pred_silu", False)
+    wide_silu = cfgs_model.get("wide_silu", True)
+    use_extrinsics = cfgs_model.get("use_extrinsics", False)
+    decoder_embed_dim = cfgs_model.get("decoder_embed_dim", None)
+    decoder_depth = cfgs_model.get("decoder_depth", None)
+    decoder_num_heads = cfgs_model.get("decoder_num_heads", None)
+    decoder_mlp_ratio = cfgs_model.get("decoder_mlp_ratio", 4.0)
+    decoder_dropout = cfgs_model.get("decoder_dropout", 0.0)
+    decoder_attn_dropout = cfgs_model.get("decoder_attn_dropout", 0.0)
+    decoder_arch = cfgs_model.get("decoder_arch", "standard").lower()
+    decoder_time_embed_dim = cfgs_model.get("decoder_time_embed_dim", None)
+    cfgs_diffusion = args.get("diffusion", {})
+    diffusion_unet_config = cfgs_diffusion.get("unet", None)
+
+    # -- DATA
+    cfgs_data = args.get("data")
+    datasets = cfgs_data.get("datasets", [])
+    dataset_path = datasets[0]
+    dataset_fpcs = cfgs_data.get("dataset_fpcs")
+    max_num_frames = max(dataset_fpcs)
+    camera_frame = cfgs_data.get("camera_frame", False)
+    camera_views = cfgs_data.get("camera_views", ["left_mp4_path"])
+    stereo_view = cfgs_data.get("stereo_view", False)
+    batch_size = cfgs_data.get("batch_size")
+    tubelet_size = cfgs_data.get("tubelet_size")
+    fps = cfgs_data.get("fps")
+    crop_size = cfgs_data.get("crop_size", 256)
+    patch_size = cfgs_data.get("patch_size")
+    pin_mem = cfgs_data.get("pin_mem", False)
+    num_workers = cfgs_data.get("num_workers", 1)
+    persistent_workers = cfgs_data.get("persistent_workers", True)
+
+    # -- DATA AUGS
+    cfgs_data_aug = args.get("data_aug")
+    horizontal_flip = cfgs_data_aug.get("horizontal_flip", False)
+    ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3])
+    rr_scale = cfgs_data_aug.get("random_resize_scale", [0.3, 1.0])
+    motion_shift = cfgs_data_aug.get("motion_shift", False)
+    reprob = cfgs_data_aug.get("reprob", 0.0)
+    use_aa = cfgs_data_aug.get("auto_augment", False)
+
+    # -- LOSS
+    cfgs_loss = args.get("loss")
+    loss_exp = cfgs_loss.get("loss_exp")
+    normalize_reps = cfgs_loss.get("normalize_reps")
+    auto_steps = min(cfgs_loss.get("auto_steps", 1), max_num_frames)
+    effective_action_dims = cfgs_loss.get("effective_action_dims", None)  # For navigation task optimization
+    action_loss_weight = cfgs_loss.get("action_loss_weight", 1.0)
+    # --
+    tokens_per_frame = int((crop_size // patch_size) ** 2)
+
+    # -- OPTIMIZATION
+    cfgs_opt = args.get("optimization")
+    ipe = cfgs_opt.get("ipe", None)
+    wd = float(cfgs_opt.get("weight_decay"))
+    final_wd = float(cfgs_opt.get("final_weight_decay"))
+    num_epochs = cfgs_opt.get("epochs")
+    anneal = cfgs_opt.get("anneal")
+    warmup = cfgs_opt.get("warmup")
+    start_lr = cfgs_opt.get("start_lr")
+    lr = cfgs_opt.get("lr")
+    final_lr = cfgs_opt.get("final_lr")
+    enc_lr_scale = cfgs_opt.get("enc_lr_scale", 1.0)
+    betas = cfgs_opt.get("betas", (0.9, 0.999))
+    eps = cfgs_opt.get("eps", 1.0e-8)
+    # ----------------------------------------------------------------------- #
+    # ----------------------------------------------------------------------- #
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.benchmark = True
+    try:
+        mp.set_start_method("spawn")
+    except Exception:
+        pass
+
+    # -- init torch distributed backend
+    world_size, rank = init_distributed()
+    logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
+
+    # -- set device
+    if not torch.cuda.is_available():
+        device = torch.device("cpu")
+    else:
+        # Use the appropriate GPU for this rank
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+
+    # -- log/checkpointing paths
+    log_file = os.path.join(folder, f"log_r{rank}.csv")
+    latest_path = os.path.join(folder, "latest.pt")
+    resume_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+    if not os.path.exists(resume_path):
+        resume_path = None
+
+    # -- make csv_logger
+    csv_logger = CSVLogger(
+        log_file,
+        ("%d", "epoch"),
+        ("%d", "itr"),
+        ("%.5f", "loss"),
+        ("%d", "iter-time(ms)"),
+        ("%d", "gpu-time(ms)"),
+        ("%d", "dataload-time(ms)"),
+        mode="+a",
+    )
+
+    # -- init model
+    encoder, decoder = init_video_model(
+        uniform_power=uniform_power,
+        device=device,
+        patch_size=patch_size,
+        max_num_frames=max_num_frames,
+        tubelet_size=tubelet_size,
+        model_name=model_name,
+        crop_size=crop_size,
+        pred_depth=pred_depth,
+        pred_num_heads=pred_num_heads,
+        pred_embed_dim=pred_embed_dim,
+        action_embed_dim=7,
+        pred_is_frame_causal=pred_is_frame_causal,
+        use_extrinsics=use_extrinsics,
+        use_sdpa=use_sdpa,
+        use_silu=use_silu,
+        use_pred_silu=use_pred_silu,
+        wide_silu=wide_silu,
+        use_rope=use_rope,
+        use_activation_checkpointing=use_activation_checkpointing,
+        effective_action_dims=effective_action_dims,
+        decoder_embed_dim=decoder_embed_dim,
+        decoder_depth=decoder_depth,
+        decoder_num_heads=decoder_num_heads,
+        decoder_mlp_ratio=decoder_mlp_ratio,
+        decoder_dropout=decoder_dropout,
+        decoder_attn_dropout=decoder_attn_dropout,
+        decoder_arch=decoder_arch,
+        decoder_time_embed_dim=decoder_time_embed_dim,
+        decoder_diffusion_config=diffusion_unet_config,
+    )
+
+    diffusion_scheduler = None
+    diffusion_prediction_type = cfgs_diffusion.get("prediction_type", "epsilon")
+    if decoder_arch in {"diffusion_unet", "diffusion_dit"}:
+        diffusion_scheduler = DDPMScheduler(
+            num_train_timesteps=cfgs_diffusion.get("num_train_timesteps", 1000),
+            beta_schedule=cfgs_diffusion.get("beta_schedule", "squaredcos_cap_v2"),
+            prediction_type=diffusion_prediction_type,
+        )
+
+    encoder = load_pretrained(
+        r_path=p_file,
+        encoder=encoder,
+        context_encoder_key=context_encoder_key,
+        load_encoder=load_encoder,
+    )
+
+    encoder.eval()
+    for param in encoder.parameters():
+        param.requires_grad_(False)
+
+    if compile_model:
+        logger.info("Compiling encoder, target_encoder, and predictor.")
+        torch._dynamo.config.optimize_ddp = False
+        encoder.compile()
+        decoder.compile()
+
+    video_collator = torch.utils.data.default_collate
+    transform = make_transforms(
+        random_horizontal_flip=horizontal_flip,
+        random_resize_aspect_ratio=ar_range,
+        random_resize_scale=rr_scale,
+        reprob=reprob,
+        auto_augment=use_aa,
+        motion_shift=motion_shift,
+        crop_size=crop_size,
+    )
+
+    # -- init data-loaders/samplers
+    (unsupervised_loader, unsupervised_sampler) = init_data(
+        data_path=dataset_path,
+        batch_size=batch_size,
+        frames_per_clip=max_num_frames,
+        tubelet_size=1,
+        fps=fps,
+        camera_views=camera_views,
+        camera_frame=camera_frame,
+        stereo_view=stereo_view,
+        transform=transform,
+        collator=video_collator,
+        num_workers=num_workers,
+        world_size=world_size,
+        pin_mem=pin_mem,
+        persistent_workers=persistent_workers,
+        rank=rank,
+    )
+    _dlen = len(unsupervised_loader)
+    if ipe is None:
+        ipe = _dlen
+    logger.info(f"iterations per epoch/dataest length: {ipe}/{_dlen}")
+
+    # -- init optimizer and scheduler
+    optimizer, scaler, scheduler, wd_scheduler = init_opt(
+        encoder=encoder,
+        decoder=decoder,
+        wd=wd,
+        final_wd=final_wd,
+        start_lr=start_lr,
+        ref_lr=lr,
+        final_lr=final_lr,
+        enc_lr_scale=enc_lr_scale,
+        iterations_per_epoch=ipe,
+        anneal=anneal,
+        warmup=warmup,
+        num_epochs=num_epochs,
+        mixed_precision=mixed_precision,
+        betas=betas,
+        eps=eps,
+    )
+    # if not debug mode, use static graph for encoder and predictor
+    if args.get("debugmode", False):
+        encoder = DistributedDataParallel(encoder, static_graph=True)
+
+    start_epoch = 0
+    # -- load training checkpoint
+    if os.path.exists(latest_path):
+        (
+            encoder,
+            decoder,
+            _,
+            _,
+            optimizer,
+            scaler,
+            start_epoch,
+        ) = load_checkpoint(
+            r_path=resume_path,
+            encoder=encoder,
+            decoder=decoder,
+            predictor=None,
+            target_encoder=None,
+            opt=optimizer,
+            scaler=scaler,
+        )
+        for _ in range(start_epoch * ipe):
+            scheduler.step()
+            wd_scheduler.step()
+
+    def save_checkpoint(epoch, path):
+        if rank != 0:
+            return
+        save_dict = {
+            "encoder": encoder.state_dict(),
+            "decoder": decoder.state_dict(),
+            "opt": optimizer.state_dict(),
+            "scaler": None if scaler is None else scaler.state_dict(),
+            "epoch": epoch,
+            "loss": loss_meter.avg,
+            "batch_size": batch_size,
+            "world_size": world_size,
+            "lr": lr,
+        }
+        try:
+            torch.save(save_dict, path)
+        except Exception as e:
+            logger.info(f"Encountered exception when saving checkpoint: {e}")
+
+    logger.info("Initializing loader...")
+    unsupervised_sampler.set_epoch(start_epoch)
+    loader = iter(unsupervised_loader)
+
+    if skip_batches > 0:
+        logger.info(f"Skip {skip_batches} batches")
+        # -- update distributed-data-loader epoch
+
+        for itr in range(skip_batches):
+            if itr % 10 == 0:
+                logger.info(f"Skip {itr}/{skip_batches} batches")
+            try:
+                _ = next(loader)
+            except Exception:
+                loader = iter(unsupervised_loader)
+                _ = next(loader)
+
+    if sync_gc:
+        gc.disable()
+        gc.collect()
+
+    # -- TRAINING LOOP
+    for epoch in range(start_epoch, num_epochs):
+        logger.info("Epoch %d" % (epoch + 1))
+
+        loss_meter = AverageMeter()
+        # jloss_meter = AverageMeter()
+        # sloss_meter = AverageMeter()
+        iter_time_meter = AverageMeter()
+        gpu_time_meter = AverageMeter()
+        data_elapsed_time_meter = AverageMeter()
+
+        for itr in range(ipe):
+            itr_start_time = time.time()
+
+            iter_retries = 0
+            iter_successful = False
+            while not iter_successful:
+                try:
+                    sample = next(loader)
+                    iter_successful = True
+                except StopIteration:
+                    logger.info("Exhausted data loaders. Refreshing...")
+                    unsupervised_sampler.set_epoch(epoch)
+                    loader = iter(unsupervised_loader)
+                except Exception as e:
+                    NUM_RETRIES = 5
+                    if iter_retries < NUM_RETRIES:
+                        logger.warning(f"Encountered exception when loading data (num retries {iter_retries}):\n{e}")
+                        iter_retries += 1
+                        time.sleep(5)
+                    else:
+                        logger.warning(f"Exceeded max retries ({NUM_RETRIES}) when loading data. Skipping batch.")
+                        raise e
+
+            def load_clips():
+                clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
+                actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
+                states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
+                extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
+                
+                # Apply action dimension filtering for navigation tasks
+                if effective_action_dims is not None:
+                    # Create mask for ineffective dimensions  
+                    action_mask = torch.ones(7, device=device)
+                    action_mask[effective_action_dims] = action_loss_weight
+                    # Zero out ineffective action dimensions to reduce their influence
+                    ineffective_dims = [i for i in range(7) if i not in effective_action_dims]
+                    if len(ineffective_dims) > 0:
+                        actions[:, :, ineffective_dims] *= 0.1  # Reduce but don't completely zero
+                        states[:, :, ineffective_dims] *= 0.1
+                        # Skip extrinsics since it's 6D and all zeros anyway
+                
+                return (clips, actions, states, extrinsics)
+
+            clips, actions, states, extrinsics = load_clips()
+            data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+
+            if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
+                logger.info("Running garbage collection...")
+                gc.collect()
+
+            def train_step():
+                _new_lr = scheduler.step()
+                _new_wd = wd_scheduler.step()
+                # def forward_encoder(c):
+                #     # # [B C T H W]
+                #     c = rearrange(c, "b c t h w -> (b t) c 1 h w")
+                #     c = repeat(c, "bt c 1 h w -> bt c v h w", v=2)
+                #     h = encoder(c)
+                #     h = rearrange(h, "(b t) n d -> b (t n) d", b=batch_size, t=max_num_frames)
+                #     if normalize_reps:
+                #         h = F.layer_norm(h, (h.size(-1),))
+                #     return h  # [B, T*2, D]
+
+                def forward_encoder(c):
+                    with torch.no_grad():
+                        h = encoder(c)
+                        h = F.layer_norm(h, (h.size(-1),))
+                    return h
+
+                def loss_fn(x, y):
+                    return F.mse_loss(x, y)
+
+                # Step 1. Forward
+                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                    h = forward_encoder(clips)  # (B, tokens, dim)
+                    re_clips = decoder(h)
+                    loss = loss_fn(re_clips, clips)
+
+                # Step 2. Backward & step
+                if mixed_precision:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                if mixed_precision:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+
+                return (
+                    float(loss),
+                    _new_lr,
+                    _new_wd,
+                )
+
+            (
+                loss,
+                _new_lr,
+                _new_wd,
+            ), gpu_etime_ms = gpu_timer(train_step)
+            iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+            loss_meter.update(loss)
+            iter_time_meter.update(iter_elapsed_time_ms)
+            gpu_time_meter.update(gpu_etime_ms)
+            data_elapsed_time_meter.update(data_elapsed_time_ms)
+
+            # -- Logging
+            # -- Logging
+            def log_stats():
+                csv_logger.log(epoch + 1, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
+                if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
+                    logger.info(
+                        f"[{epoch + 1}, {itr:5d}] loss: {loss_meter.avg:.3f} "
+                        f"[wd: {_new_wd:.2e}] [lr: {_new_lr:.2e}] "
+                        f"[mem: {torch.cuda.max_memory_allocated() / 1024.0**2:.2e}] "
+                        f"[iter: {iter_time_meter.avg:.1f} ms] "
+                        f"[gpu: {gpu_time_meter.avg:.1f} ms] "
+                        f"[data: {data_elapsed_time_meter.avg:.1f} ms]"
+                    )
+
+            log_stats()
+            assert not np.isnan(loss), "loss is nan"
+
+        # -- Save Checkpoint
+        logger.info("avg. loss %.3f" % loss_meter.avg)
+        # -- Save Last
+        if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
+            save_checkpoint(epoch + 1, latest_path)
+            if save_every_freq > 0 and epoch % save_every_freq == 0:
+                save_every_file = f"e{epoch}.pt"
+                save_every_path = os.path.join(folder, save_every_file)
+                save_checkpoint(epoch + 1, save_every_path)

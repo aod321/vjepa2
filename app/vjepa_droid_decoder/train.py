@@ -30,6 +30,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch.nn.parallel import DistributedDataParallel
+from diffusers import DDPMScheduler
 
 from app.vjepa_droid_decoder.droid import init_data
 from app.vjepa_droid_decoder.transforms import make_transforms
@@ -106,6 +107,10 @@ def main(args, resume_preempt=False):
     decoder_mlp_ratio = cfgs_model.get("decoder_mlp_ratio", 4.0)
     decoder_dropout = cfgs_model.get("decoder_dropout", 0.0)
     decoder_attn_dropout = cfgs_model.get("decoder_attn_dropout", 0.0)
+    decoder_arch = cfgs_model.get("decoder_arch", "standard").lower()
+    decoder_time_embed_dim = cfgs_model.get("decoder_time_embed_dim", None)
+    cfgs_diffusion = args.get("diffusion", {})
+    diffusion_unet_config = cfgs_diffusion.get("unet", None)
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -229,7 +234,19 @@ def main(args, resume_preempt=False):
         decoder_mlp_ratio=decoder_mlp_ratio,
         decoder_dropout=decoder_dropout,
         decoder_attn_dropout=decoder_attn_dropout,
+        decoder_arch=decoder_arch,
+        decoder_time_embed_dim=decoder_time_embed_dim,
+        decoder_diffusion_config=diffusion_unet_config,
     )
+
+    diffusion_scheduler = None
+    diffusion_prediction_type = cfgs_diffusion.get("prediction_type", "epsilon")
+    if decoder_arch in {"diffusion_unet", "diffusion_dit"}:
+        diffusion_scheduler = DDPMScheduler(
+            num_train_timesteps=cfgs_diffusion.get("num_train_timesteps", 1000),
+            beta_schedule=cfgs_diffusion.get("beta_schedule", "squaredcos_cap_v2"),
+            prediction_type=diffusion_prediction_type,
+        )
 
     encoder = load_pretrained(
         r_path=p_file,
@@ -309,13 +326,18 @@ def main(args, resume_preempt=False):
     if os.path.exists(latest_path):
         (
             encoder,
-            target_encoder,
+            decoder,
+            _,
+            _,
             optimizer,
             scaler,
             start_epoch,
         ) = load_checkpoint(
             r_path=resume_path,
             encoder=encoder,
+            decoder=decoder,
+            predictor=None,
+            target_encoder=None,
             opt=optimizer,
             scaler=scaler,
         )
@@ -489,7 +511,7 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_encoder(clips) # (B, C, T, H, W)
+                    h = forward_encoder(clips)  # (B, tokens, dim)
                     re_clips = decoder(h)
                     loss = loss_fn(re_clips, clips)
 
