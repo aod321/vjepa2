@@ -120,6 +120,7 @@ configs/local
 *.zip
 *.mp4
 lfh_experiment/
-node_modules
-.claude
-.cursor
+node_modules/
+.claude/
+.cursor/
+*.png
