@@ -1,8 +1,0 @@
-{
-  "episode_name": "episode_0342_20251213_232108",
-  "timestamp": "2025-12-13T23:21:08.408068",
-  "episode_length": 110,
-  "episode_reward": 1.0,
-  "video_path": "recordings/MP4/episode_camera.mp4",
-  "trajectory_path": "trajectory.h5"
-}
